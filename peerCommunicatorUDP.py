@@ -5,178 +5,251 @@ import random
 import time
 import pickle
 from requests import get
-
-#handShakes = [] # not used; only if we need to check whose handshake is missing
+import heapq
 
 # Counter to make sure we have received handshakes from all other processes
 handShakeCount = 0
 
 PEERS = []
+N = 0 # Number of peers, will be updated.
 
-# UDP sockets to send and receive data messages:
-# Create send socket
+# --- Variáveis para Ordenação Total com Relógio de Lamport ---
+lamportClock = 0
+messageQueue = []  # Fila de prioridade para mensagens recebidas (timestamp, origin_id, payload)
+logList = [] # Log final de mensagens entregues na ordem correta
+
+# Sockets UDP
 sendSocket = socket(AF_INET, SOCK_DGRAM)
-#Create and bind receive socket
 recvSocket = socket(AF_INET, SOCK_DGRAM)
 recvSocket.bind(('0.0.0.0', PEER_UDP_PORT))
 
-# TCP socket to receive start signal from the comparison server:
+# Socket TCP para sinal do servidor
 serverSock = socket(AF_INET, SOCK_STREAM)
 serverSock.bind(('0.0.0.0', PEER_TCP_PORT))
 serverSock.listen(1)
 
+# Lock para proteger o acesso concorrente às variáveis compartilhadas (clock, fila)
+lock = threading.Lock()
 
 def get_public_ip():
   ipAddr = get('https://api.ipify.org').content.decode('utf8')
-  print('My public IP address is: {}'.format(ipAddr))
+  print('Meu IP público é: {}'.format(ipAddr))
   return ipAddr
 
-# Function to register this peer with the group manager
 def registerWithGroupManager():
   clientSock = socket(AF_INET, SOCK_STREAM)
-  print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+  print ('Conectando ao group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
   clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
   ipAddr = get_public_ip()
   req = {"op":"register", "ipaddr":ipAddr, "port":PEER_UDP_PORT}
   msg = pickle.dumps(req)
-  print ('Registering with group manager: ', req)
+  print ('Registrando no group manager: ', req)
   clientSock.send(msg)
   clientSock.close()
 
 def getListOfPeers():
+  global N
   clientSock = socket(AF_INET, SOCK_STREAM)
-  print ('Connecting to group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
+  print ('Conectando ao group manager: ', (GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
   clientSock.connect((GROUPMNGR_ADDR,GROUPMNGR_TCP_PORT))
   req = {"op":"list"}
   msg = pickle.dumps(req)
-  print ('Getting list of peers from group manager: ', req)
+  print ('Obtendo lista de peers do group manager: ', req)
   clientSock.send(msg)
   msg = clientSock.recv(2048)
-  PEERS = pickle.loads(msg)
-  print ('Got list of peers: ', PEERS)
+  peers = pickle.loads(msg)
+  print ('Lista de peers obtida: ', peers)
   clientSock.close()
-  return PEERS
+  N = len(peers) # Atualiza o número total de peers
+  return peers
 
 class MsgHandler(threading.Thread):
-  def __init__(self, sock):
+  def __init__(self, sock, myself_id, num_peers):
     threading.Thread.__init__(self)
     self.sock = sock
+    self.myself = myself_id
+    self.num_peers = num_peers
+    # Dicionário para rastrear o timestamp da última mensagem vista de cada peer
+    self.last_seen_clocks = {i: -1 for i in range(num_peers)}
+
+  def deliver_messages(self):
+    """Verifica a fila e entrega mensagens que são estáveis."""
+    global messageQueue, logList
+    
+    while messageQueue:
+      # Ordena a fila por timestamp, desempatando com o ID do processo
+      messageQueue.sort()
+      
+      # Pega a mensagem com menor timestamp
+      head_timestamp, head_origin_id, head_payload = messageQueue[0]
+      
+      # Verifica se a mensagem no topo da fila é entregável.
+      # Uma mensagem é entregável se já recebemos uma mensagem de TODOS os outros
+      # processos com um timestamp maior que o da mensagem no topo.
+      can_deliver = True
+      for i in range(self.num_peers):
+        if self.last_seen_clocks[i] < head_timestamp:
+          can_deliver = False
+          break
+      
+      if can_deliver:
+        # Remove a mensagem da fila e a adiciona ao log
+        msg_to_deliver = heapq.heappop(messageQueue)
+        
+        # O payload original está dentro da tupla
+        original_sender = msg_to_deliver[2][0]
+        msg_number = msg_to_deliver[2][1]
+        
+        print(f'ENTREGUE: Mensagem {msg_number} do processo {original_sender} com timestamp {msg_to_deliver[0]}')
+        logList.append(msg_to_deliver[2])
+      else:
+        # Se a mensagem do topo não pode ser entregue, nenhuma outra pode.
+        break
 
   def run(self):
-    print('Handler is ready. Waiting for the handshakes...')
+    print('Handler está pronto. Aguardando mensagens...')
     
-    #global handShakes
-    global handShakeCount
+    global lamportClock, handShakeCount, messageQueue
     
-    logList = []
-    
-    # Wait until handshakes are received from all other processes
-    # (to make sure that all processes are synchronized before they start exchanging messages)
-    while handShakeCount < N:
-      msgPack = self.sock.recv(1024)
-      msg = pickle.loads(msgPack)
-      #print ('########## unpickled msgPack: ', msg)
-      if msg[0] == 'READY':
-
-        # To do: send reply of handshake and wait for confirmation
-
-        handShakeCount = handShakeCount + 1
-        #handShakes[msg[1]] = 1
-        print('--- Handshake received: ', msg[1])
-
-    print('Secondary Thread: Received all handshakes. Entering the loop to receive messages.')
-
     stopCount=0 
     while True:                
-      msgPack = self.sock.recv(1024)   # receive data from client
-      msg = pickle.loads(msgPack)
-      if msg[0] == -1:   # count the 'stop' messages from the other processes
-        stopCount = stopCount + 1
-        if stopCount == N:
-          break  # stop loop when all other processes have finished
-      else:
-        print('Message ' + str(msg[1]) + ' from process ' + str(msg[0]))
-        logList.append(msg)
+      msgPack = self.sock.recv(2048)
+      if not msgPack:
+        continue
         
-    # Write log file
-    logFile = open('logfile'+str(myself)+'.log', 'w')
+      msg = pickle.loads(msgPack)
+
+      lock.acquire()
+      
+      # Atualiza o relógio de Lamport
+      received_clock = msg.get('clock', -1)
+      lamportClock = max(lamportClock, received_clock) + 1
+      
+      # Atualiza o último timestamp visto para o remetente da mensagem
+      sender_id = msg.get('sender_id')
+      if sender_id is not None:
+          self.last_seen_clocks[sender_id] = max(self.last_seen_clocks.get(sender_id, -1), received_clock)
+
+      msg_type = msg.get('type')
+
+      if msg_type == 'HANDSHAKE':
+        handShakeCount += 1
+        print(f'--- Handshake recebido de {msg["sender_id"]}. Total: {handShakeCount}')
+      
+      elif msg_type == 'DATA':
+        # Adiciona a mensagem à fila de prioridade
+        # Formato na fila: (timestamp, origin_id, payload)
+        item = (msg['clock'], msg['origin_id'], msg['payload'])
+        heapq.heappush(messageQueue, item)
+        print(f'Na fila: Mensagem {msg["payload"][1]} de {msg["origin_id"]} com clock {msg["clock"]}')
+
+      elif msg_type == 'STOP':
+        stopCount += 1
+        if stopCount == self.num_peers:
+          break
+      
+      # Tenta entregar mensagens da fila
+      self.deliver_messages()
+
+      lock.release()
+
+    # Finalização: garantir que todas as mensagens na fila sejam entregues
+    while len(logList) < self.num_peers * N_MSGS:
+        lock.acquire()
+        self.deliver_messages()
+        lock.release()
+        time.sleep(0.1)
+
+    # Escrever arquivo de log
+    logFile = open('logfile'+str(self.myself)+'.log', 'w')
     logFile.writelines(str(logList))
     logFile.close()
     
-    # Send the list of messages to the server (using a TCP socket) for comparison
-    print('Sending the list of messages to the server for comparison...')
+    # Enviar a lista de mensagens para o servidor de comparação
+    print('Enviando a lista de mensagens para o servidor para comparação...')
     clientSock = socket(AF_INET, SOCK_STREAM)
     clientSock.connect((SERVER_ADDR, SERVER_PORT))
     msgPack = pickle.dumps(logList)
     clientSock.send(msgPack)
     clientSock.close()
     
-    # Reset the handshake counter
-    handShakeCount = 0
-
     exit(0)
 
-# Function to wait for start signal from comparison server:
 def waitToStart():
   (conn, addr) = serverSock.accept()
   msgPack = conn.recv(1024)
   msg = pickle.loads(msgPack)
-  myself = msg[0]
+  myself_id = msg[0]
   nMsgs = msg[1]
-  conn.send(pickle.dumps('Peer process '+str(myself)+' started.'))
+  conn.send(pickle.dumps('Processo peer '+str(myself_id)+' iniciado.'))
   conn.close()
-  return (myself,nMsgs)
+  return (myself_id, nMsgs)
 
-# From here, code is executed when program starts:
+# --- Início da Execução ---
 registerWithGroupManager()
 while 1:
-  print('Waiting for signal to start...')
-  (myself, nMsgs) = waitToStart()
-  print('I am up, and my ID is: ', str(myself))
+  print('Aguardando sinal para iniciar...')
+  (myself, N_MSGS) = waitToStart()
+  print('Estou ativo, meu ID é: ', str(myself))
 
-  if nMsgs == 0:
-    print('Terminating.')
+  if N_MSGS == 0:
+    print('Terminando.')
     exit(0)
-
-  # Wait for other processes to be ready
-  # To Do: fix bug that causes a failure when not all processes are started within this time
-  # (fully started processes start sending data messages, which the others try to interpret as control messages) 
-  time.sleep(5)
-
-  # Create receiving message handler
-  msgHandler = MsgHandler(recvSocket)
-  msgHandler.start()
-  print('Handler started')
-
+  
   PEERS = getListOfPeers()
   
-  # Send handshakes
-  # To do: Must continue sending until it gets a reply from each process
-  #        Send confirmation of reply
+  # Cria e inicia o handler de mensagens
+  msgHandler = MsgHandler(recvSocket, myself, N)
+  msgHandler.start()
+  print('Handler iniciado')
+
+  time.sleep(2) # Pausa para garantir que todos os handlers estejam prontos
+
+  # Envia handshakes
+  lock.acquire()
+  lamportClock += 1
+  msg = {'type': 'HANDSHAKE', 'sender_id': myself, 'clock': lamportClock}
+  msgPack = pickle.dumps(msg)
   for addrToSend in PEERS:
-    print('Sending handshake to ', addrToSend)
-    msg = ('READY', myself)
-    msgPack = pickle.dumps(msg)
-    sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
-    #data = recvSocket.recvfrom(128) # Handshadke confirmations have not yet been implemented
+    print('Enviando handshake para ', addrToSend)
+    sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
+  lock.release()
 
-  print('Main Thread: Sent all handshakes. handShakeCount=', str(handShakeCount))
-
+  # Espera por todos os handshakes
+  print('Thread Principal: Enviei todos os handshakes.')
   while (handShakeCount < N):
-    pass  # find a better way to wait for the handshakes
+    time.sleep(0.5)
 
-  # Send a sequence of data messages to all other processes 
-  for msgNumber in range(0, nMsgs):
-    # Wait some random time between successive messages
+  print("Todos os peers estão prontos. Começando o envio de mensagens de dados.")
+
+  # Envia uma sequência de mensagens de dados para todos os outros processos
+  for msgNumber in range(0, N_MSGS):
     time.sleep(random.randrange(10,100)/1000)
-    msg = (myself, msgNumber)
+    
+    lock.acquire()
+    lamportClock += 1
+    # Mensagem com tipo, payload, clock e ID do remetente original
+    msg = {
+        'type': 'DATA',
+        'payload': (myself, msgNumber),
+        'clock': lamportClock,
+        'origin_id': myself,
+        'sender_id': myself
+    }
     msgPack = pickle.dumps(msg)
+    lock.release()
+    
     for addrToSend in PEERS:
-      sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
-      print('Sent message ' + str(msgNumber))
+      sendSocket.sendto(msgPack, (addrToSend, PEER_UDP_PORT))
+    print(f'Enviei mensagem {msgNumber} com clock {msg["clock"]}')
 
-  # Tell all processes that I have no more messages to send
+  # Avisa a todos os processos que não tem mais mensagens para enviar
+  print("Terminei de enviar mensagens. Enviando sinal de parada.")
+  lock.acquire()
+  lamportClock += 1
+  msg = {'type': 'STOP', 'sender_id': myself, 'clock': lamportClock}
+  msgPack = pickle.dumps(msg)
+  lock.release()
+  
   for addrToSend in PEERS:
-    msg = (-1,-1)
-    msgPack = pickle.dumps(msg)
     sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
